@@ -176,13 +176,21 @@ Return ONLY a raw valid JSON object (no markdown fences or commentary) matching 
 function cleanJsonResponse(raw: string): string {
   const trimmed = raw.trim();
   const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
-  if (fenced) return fenced[1].trim();
-  const firstBrace = trimmed.indexOf('{');
-  const lastBrace = trimmed.lastIndexOf('}');
+  let jsonStr = fenced ? fenced[1].trim() : trimmed;
+
+  const firstBrace = jsonStr.indexOf('{');
+  const lastBrace = jsonStr.lastIndexOf('}');
   if (firstBrace !== -1 && lastBrace > firstBrace) {
-    return trimmed.slice(firstBrace, lastBrace + 1);
+    jsonStr = jsonStr.slice(firstBrace, lastBrace + 1);
   }
-  return trimmed || '{}';
+
+  // Repair common LLM JSON punctuation slips: missing commas between objects/arrays & trailing commas
+  jsonStr = jsonStr
+    .replace(/\}\s*\{/g, '},{')
+    .replace(/\]\s*\[/g, '],[')
+    .replace(/,\s*([}\]])/g, '$1');
+
+  return jsonStr || '{}';
 }
 
 function parseRetryDelayMs(err: unknown, fallbackMs: number): number {
@@ -198,8 +206,10 @@ function parseRetryDelayMs(err: unknown, fallbackMs: number): number {
 }
 
 function isTransientError(err: unknown): boolean {
+  if (err instanceof SyntaxError) return true;
   const msg = err instanceof Error ? err.message : String(err);
   return (
+    msg.includes('JSON') ||
     msg.includes('503') ||
     msg.includes('429') ||
     msg.includes('rate_limit_exceeded') ||
@@ -277,8 +287,6 @@ async function callOpenAiCompatibleJson(
         break;
       }
       const msg = err instanceof Error ? err.message : String(err);
-      // If switching to a different Groq model with its own TPM bucket, only wait 500ms;
-      // if retrying the same model, wait for Groq's exact reset window.
       const nextModel = modelQueue[i + 1];
       const waitMs =
         IS_GROQ && nextModel !== model && msg.includes('429')

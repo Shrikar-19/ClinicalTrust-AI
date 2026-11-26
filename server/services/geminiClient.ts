@@ -1,25 +1,10 @@
-import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import type { DocumentClassification } from '../types.ts';
 
-const PRIMARY_MODEL = 'gemini-3.5-flash-lite';
-const FALLBACK_MODEL = 'gemini-3.8-flash';
-
-function getAiClient(): GoogleGenAI {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
-    throw new Error(
-      'GEMINI_API_KEY is not configured in server environment secrets. Add it in Settings > Secrets to run AI extraction.'
-    );
-  }
-  return new GoogleGenAI({
-    apiKey,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
-      },
-    },
-  });
-}
+const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env ?? {};
+const LLM_BASE_URL = (env.LLM_BASE_URL || 'http://localhost:11434/v1').replace(/\/$/, '');
+const LLM_API_KEY = env.LLM_API_KEY || 'ollama';
+const PRIMARY_MODEL = env.LLM_MODEL || 'qwen2.5:3b';
+const FALLBACK_MODEL = env.LLM_FALLBACK_MODEL || PRIMARY_MODEL;
 
 export interface GeminiDocumentExtraction {
   documentId?: string;
@@ -99,56 +84,126 @@ export interface GeminiDocumentExtraction {
 }
 
 const EXTRACTION_SYSTEM_INSTRUCTION = `You are a strict Clinical Information Extraction engine for ClinicalTrust AI.
-Extract EVERY clinical detail explicitly present in the document into the JSON schema fields:
-1. Extract ONLY facts explicitly stated in the provided medical document text.
-2. NEVER invent, infer, or fabricate missing clinical details (if age, dosage, allergy, or date is absent, return null or explicitly record it as Not Mentioned / Missing).
-3. A missing allergy mention (or "Not mentioned") MUST NEVER be recorded as "No Known Allergies" — record status as "Not Mentioned" in allergiesMentioned AND add a DischargeInfo/Allergy fact for it.
-4. A lab test mentioned as ordered without a result MUST have orderedWithoutResult=true and resultValue=null — NEVER interpret missing results as normal/negative.
-5. Distinguish the clinical event date (when the exam/test/event happened) from the upload date. Format dates as YYYY-MM-DD when day, month, and year are known.
-6. Every extracted item MUST include an exact verbatim quote from the text in sourcePassage/passage and a sourceLocation (e.g., "Page 1, Line 4" or "Section: Medications").
-7. Populate ALL relevant arrays: facts, diagnosesMentioned, medicationsMentioned, allergiesMentioned, labsMentioned, and timelineEvents.`;
-
-function formatFriendlyGeminiError(err: unknown): Error {
-  const raw = err instanceof Error ? err.message : String(err);
-  try {
-    const parsed = JSON.parse(raw) as { error?: { code?: number; message?: string; status?: string } };
-    if (parsed?.error?.message) {
-      return new Error(`Gemini service notice (${parsed.error.code ?? parsed.error.status ?? 'API'}): ${parsed.error.message}`);
+Extract clinical details explicitly stated in the document into a valid JSON object matching this exact schema:
+{
+  "documentType": "Admission Note | Laboratory Report | Progress Note | Prescription | Discharge Summary | Consultation Note | Unclassified Clinical Record",
+  "documentDate": "YYYY-MM-DD or null",
+  "patientIdentifier": "string or null",
+  "age": "number or null",
+  "sex": "string or null",
+  "facts": [
+    {
+      "category": "PatientIdentifier | Age | DocumentDate | ClinicalEventDate | Symptom | Diagnosis | DiagnosisStatus | Medication | Dosage | Allergy | LaboratoryFinding | TreatmentChange | DischargeInfo",
+      "factValue": "string",
+      "normalizedValue": "string or null",
+      "sourceLocation": "string",
+      "sourcePassage": "short verbatim quote",
+      "clinicalEventDate": "YYYY-MM-DD or null",
+      "explicitlyNegatedOrMissing": false
     }
-  } catch {
-    // Not raw JSON
+  ],
+  "diagnosesMentioned": [
+    {
+      "name": "string",
+      "statusInDoc": "Confirmed | Suspected | Ruled Out | Mentioned",
+      "date": "YYYY-MM-DD or null",
+      "location": "string",
+      "passage": "short verbatim quote"
+    }
+  ],
+  "medicationsMentioned": [
+    {
+      "name": "string",
+      "dosage": "string or null",
+      "frequency": "string or null",
+      "context": "Admission | Prescription | Progress Note | Discharge Summary",
+      "action": "Prescribed | Continued | Discontinued | Mentioned",
+      "location": "string",
+      "passage": "short verbatim quote"
+    }
+  ],
+  "allergiesMentioned": [
+    {
+      "allergen": "string or null",
+      "status": "Documented Allergy | No Known Allergies | Not Mentioned",
+      "location": "string",
+      "passage": "short verbatim quote"
+    }
+  ],
+  "labsMentioned": [
+    {
+      "testName": "string",
+      "resultValue": "string or null",
+      "interpretation": "string or null",
+      "clinicalTestDate": "YYYY-MM-DD or null",
+      "orderedWithoutResult": false,
+      "location": "string",
+      "passage": "short verbatim quote"
+    }
+  ],
+  "timelineEvents": [
+    {
+      "clinicalEventDate": "YYYY-MM-DD or null",
+      "eventCategory": "Admission | Symptom | Laboratory Test | Diagnosis | Medication Change | Progress Note | Discharge",
+      "title": "string",
+      "description": "concise summary",
+      "location": "string",
+      "passage": "short verbatim quote"
+    }
+  ]
+}
+
+Rules:
+1. Return ONLY raw valid JSON with all top-level keys present (use [] for empty arrays, null for missing scalars).
+2. Extract ONLY facts explicitly stated in the text; do not invent or infer missing details.
+3. Keep facts[] concise: only record key demographics, symptoms, allergy status, treatment changes, or discharge info not already duplicated across multiple entries.
+4. A missing allergy mention must be recorded as "Not Mentioned" in allergiesMentioned (not "No Known Allergies") plus one Allergy fact.
+5. A lab ordered without a result must have orderedWithoutResult=true and resultValue=null.
+6. Format known dates as YYYY-MM-DD and keep verbatim quotes concise (under 20 words).`;
+
+const SYNTHESIS_SYSTEM_INSTRUCTION = `You are an evidence-verification clinical intelligence assistant. Do not invent facts, claim clinical validation, or recommend medication changes, and highlight where conclusions must pause for human clinician review.
+Return ONLY a valid JSON object matching this exact schema:
+{
+  "overviewInterpretation": "string",
+  "timelineInterpretation": "string",
+  "diagnosisInterpretation": "string",
+  "medicationInterpretation": "string",
+  "labInterpretation": "string",
+  "humanReviewRecommendations": ["string"]
+}`;
+
+function cleanJsonResponse(raw: string): string {
+  const trimmed = raw.trim();
+  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  if (fenced) return fenced[1].trim();
+  const firstBrace = trimmed.indexOf('{');
+  const lastBrace = trimmed.lastIndexOf('}');
+  if (firstBrace !== -1 && lastBrace > firstBrace) {
+    return trimmed.slice(firstBrace, lastBrace + 1);
   }
-  if (raw.includes('503') || raw.includes('UNAVAILABLE')) {
-    return new Error('Gemini models are temporarily experiencing high demand (503). Please retry in a few moments.');
-  }
-  return err instanceof Error ? err : new Error(raw);
+  return trimmed || '{}';
 }
 
 function isTransientError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   return (
     msg.includes('503') ||
-    msg.includes('UNAVAILABLE') ||
     msg.includes('429') ||
-    msg.includes('RESOURCE_EXHAUSTED') ||
-    msg.includes('DEADLINE_EXCEEDED') ||
-    msg.includes('ECONNRESET')
+    msg.includes('ECONNRESET') ||
+    msg.includes('ETIMEDOUT') ||
+    msg.includes('fetch failed')
   );
 }
 
-/**
- * Executes a Gemini generation call using gemini-3.1-flash-lite first (fast, low latency),
- * with automatic fallback to gemini-4-hydrogen and exponential backoff on transient 503/429 spikes.
- */
-async function generateWithModelFallback(
-  ai: GoogleGenAI,
-  buildRequest: (model: string) => Parameters<typeof ai.models.generateContent>[0]
+async function callOpenAiCompatibleJson(
+  systemInstruction: string,
+  userPrompt: string,
+  maxTokens = 1400
 ): Promise<{ text: string; modelUsed: string; retriesUsed: number }> {
   const attempts = [
     { model: PRIMARY_MODEL, delayBeforeMs: 0 },
     { model: PRIMARY_MODEL, delayBeforeMs: 500 },
-    { model: FALLBACK_MODEL, delayBeforeMs: 250 },
-    { model: FALLBACK_MODEL, delayBeforeMs: 900 },
+    { model: FALLBACK_MODEL, delayBeforeMs: 400 },
   ];
 
   let lastError: unknown;
@@ -159,203 +214,178 @@ async function generateWithModelFallback(
     if (delayBeforeMs > 0) {
       await new Promise((resolve) => setTimeout(resolve, delayBeforeMs));
     }
+
     try {
-      const response = await ai.models.generateContent(buildRequest(model));
+      const response = await fetch(`${LLM_BASE_URL}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${LLM_API_KEY}`,
+        },
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: 'system', content: systemInstruction },
+            { role: 'user', content: userPrompt },
+          ],
+          response_format: { type: 'json_object' },
+          temperature: 0.1,
+          max_tokens: maxTokens,
+        }),
+      });
+
+      if (!response.ok) {
+        const errBody = await response.text();
+        throw new Error(`LLM API error (${response.status}): ${errBody}`);
+      }
+
+      const data = (await response.json()) as {
+        choices?: Array<{ message?: { content?: string } }>;
+      };
+
+      const rawText = data.choices?.[0]?.message?.content ?? '{}';
       return {
-        text: (response.text ?? '{}').trim(),
+        text: cleanJsonResponse(rawText),
         modelUsed: model,
         retriesUsed,
       };
     } catch (err) {
       lastError = err;
       retriesUsed += 1;
-      if (!isTransientError(err) && i === 0) {
-        if (attempts[i + 1]?.model === PRIMARY_MODEL) {
-          i += 1;
-        }
-      } else if (!isTransientError(err)) {
+      if (!isTransientError(err)) {
         break;
       }
     }
   }
 
-  throw formatFriendlyGeminiError(lastError);
+  throw lastError instanceof Error
+    ? lastError
+    : new Error(`LLM request failed at ${LLM_BASE_URL}: ${String(lastError)}`);
 }
-
-const SINGLE_DOCUMENT_SCHEMA = {
-  type: Type.OBJECT,
-  required: [
-    'documentType',
-    'documentDate',
-    'facts',
-    'diagnosesMentioned',
-    'medicationsMentioned',
-    'allergiesMentioned',
-    'labsMentioned',
-    'timelineEvents',
-  ],
-  properties: {
-    documentType: {
-      type: Type.STRING,
-      description:
-        'One of: Admission Note, Laboratory Report, Progress Note, Prescription, Discharge Summary, Consultation Note, Unclassified Clinical Record',
-    },
-    documentDate: { type: Type.STRING, nullable: true },
-    patientIdentifier: { type: Type.STRING, nullable: true },
-    age: { type: Type.INTEGER, nullable: true },
-    sex: { type: Type.STRING, nullable: true },
-    facts: {
-      type: Type.ARRAY,
-      items: {
-        type: Type.OBJECT,
-        required: ['category', 'factValue', 'sourceLocation', 'sourcePassage'],
-        properties: {
-          category: {
-            type: Type.STRING,
-            enum: [
-              'PatientIdentifier',
-              'Age',
-              'DocumentDate',
-              'ClinicalEventDate',
-              'Symptom',
-              'Diagnosis',
-              'DiagnosisStatus',
-              'Medication',
-              'Dosage',
-              'Allergy',
-              'LaboratoryFinding',
-              'TreatmentChange',
-              'DischargeInfo',
-            ],
-          },
-          factValue: { type: Type.STRING },
-          normalizedValue: { type: Type.STRING, nullable: true },
-          sourceLocation: { type: Type.STRING },
-          sourcePassage: { type: Type.STRING },
-          clinicalEventDate: { type: Type.STRING, nullable: true },
-          explicitlyNegatedOrMissing: { type: Type.BOOLEAN },
-        },
-      },
-    },
-    diagnosesMentioned: {
-      type: Type.ARRAY,
-      items: {
-        type: Type.OBJECT,
-        required: ['name', 'statusInDoc', 'location', 'passage'],
-        properties: {
-          name: { type: Type.STRING },
-          statusInDoc: {
-            type: Type.STRING,
-            enum: ['Confirmed', 'Suspected', 'Ruled Out', 'Mentioned'],
-          },
-          date: { type: Type.STRING, nullable: true },
-          location: { type: Type.STRING },
-          passage: { type: Type.STRING },
-        },
-      },
-    },
-    medicationsMentioned: {
-      type: Type.ARRAY,
-      items: {
-        type: Type.OBJECT,
-        required: ['name', 'context', 'action', 'location', 'passage'],
-        properties: {
-          name: { type: Type.STRING },
-          dosage: { type: Type.STRING, nullable: true },
-          frequency: { type: Type.STRING, nullable: true },
-          context: {
-            type: Type.STRING,
-            enum: ['Admission', 'Prescription', 'Progress Note', 'Discharge Summary'],
-          },
-          action: {
-            type: Type.STRING,
-            enum: ['Prescribed', 'Continued', 'Discontinued', 'Mentioned'],
-          },
-          location: { type: Type.STRING },
-          passage: { type: Type.STRING },
-        },
-      },
-    },
-    allergiesMentioned: {
-      type: Type.ARRAY,
-      items: {
-        type: Type.OBJECT,
-        required: ['status', 'location', 'passage'],
-        properties: {
-          allergen: { type: Type.STRING, nullable: true },
-          status: {
-            type: Type.STRING,
-            enum: ['Documented Allergy', 'No Known Allergies', 'Not Mentioned'],
-          },
-          location: { type: Type.STRING },
-          passage: { type: Type.STRING },
-        },
-      },
-    },
-    labsMentioned: {
-      type: Type.ARRAY,
-      items: {
-        type: Type.OBJECT,
-        required: ['testName', 'orderedWithoutResult', 'location', 'passage'],
-        properties: {
-          testName: { type: Type.STRING },
-          resultValue: { type: Type.STRING, nullable: true },
-          interpretation: { type: Type.STRING, nullable: true },
-          clinicalTestDate: { type: Type.STRING, nullable: true },
-          orderedWithoutResult: { type: Type.BOOLEAN },
-          location: { type: Type.STRING },
-          passage: { type: Type.STRING },
-        },
-      },
-    },
-    timelineEvents: {
-      type: Type.ARRAY,
-      items: {
-        type: Type.OBJECT,
-        required: ['eventCategory', 'title', 'description', 'location', 'passage'],
-        properties: {
-          clinicalEventDate: { type: Type.STRING, nullable: true },
-          eventCategory: { type: Type.STRING },
-          title: { type: Type.STRING },
-          description: { type: Type.STRING },
-          location: { type: Type.STRING },
-          passage: { type: Type.STRING },
-        },
-      },
-    },
-  },
-};
 
 export async function extractClinicalDocumentWithGemini(params: {
   documentName: string;
   uploadDate: string;
   rawText: string;
 }): Promise<{ extraction: GeminiDocumentExtraction; modelUsed: string; retriesUsed: number }> {
-  const ai = getAiClient();
-
-  const { text, modelUsed, retriesUsed } = await generateWithModelFallback(ai, (model) => ({
-    model,
-    contents: `Document Name: ${params.documentName}
+  const userPrompt = `Document Name: ${params.documentName}
 System Upload Date: ${params.uploadDate}
 
 --- BEGIN DOCUMENT TEXT ---
 ${params.rawText}
 --- END DOCUMENT TEXT ---
 
-Extract all structured clinical facts (symptoms, allergies, diagnoses, medications, dosages, lab findings, discharge details), diagnosesMentioned, medicationsMentioned, allergiesMentioned, labsMentioned, and timelineEvents strictly grounded in the text above.`,
-    config: {
-      systemInstruction: EXTRACTION_SYSTEM_INSTRUCTION,
-      thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-      responseMimeType: 'application/json',
-      responseSchema: SINGLE_DOCUMENT_SCHEMA,
-    },
-  }));
+Extract all structured clinical facts, diagnosesMentioned, medicationsMentioned, allergiesMentioned, labsMentioned, and timelineEvents strictly grounded in the text above. Return valid JSON only.`;
 
-  return {
-    extraction: JSON.parse(text) as GeminiDocumentExtraction,
-    modelUsed,
-    retriesUsed,
+  const { text, modelUsed, retriesUsed } = await callOpenAiCompatibleJson(
+    EXTRACTION_SYSTEM_INSTRUCTION,
+    userPrompt,
+    1400
+  );
+
+  const parsed = JSON.parse(text) as Partial<GeminiDocumentExtraction>;
+
+  const facts = Array.isArray(parsed.facts)
+    ? parsed.facts
+      .filter((f) => f && typeof f.factValue === 'string' && f.factValue.trim().length > 0)
+      .map((f) => ({
+        category: f.category || 'DischargeInfo',
+        factValue: f.factValue.trim(),
+        normalizedValue: f.normalizedValue ?? null,
+        sourceLocation: f.sourceLocation || 'Document Text',
+        sourcePassage: f.sourcePassage || f.factValue.trim(),
+        clinicalEventDate: f.clinicalEventDate ?? null,
+        explicitlyNegatedOrMissing: Boolean(f.explicitlyNegatedOrMissing),
+      }))
+    : [];
+
+  const diagnosesMentioned = Array.isArray(parsed.diagnosesMentioned)
+    ? parsed.diagnosesMentioned
+      .filter((d) => d && typeof d.name === 'string' && d.name.trim().length > 0)
+      .map((d) => ({
+        name: d.name.trim(),
+        statusInDoc: d.statusInDoc || 'Mentioned',
+        date: d.date ?? null,
+        location: d.location || 'Document Text',
+        passage: d.passage || d.name.trim(),
+      }))
+    : [];
+
+  const medicationsMentioned = Array.isArray(parsed.medicationsMentioned)
+    ? parsed.medicationsMentioned
+      .filter((m) => m && typeof m.name === 'string' && m.name.trim().length > 0)
+      .map((m) => ({
+        name: m.name.trim(),
+        dosage: m.dosage ?? null,
+        frequency: m.frequency ?? null,
+        context: m.context || 'Progress Note',
+        action: m.action || 'Mentioned',
+        location: m.location || 'Document Text',
+        passage: m.passage || m.name.trim(),
+      }))
+    : [];
+
+  const allergiesMentioned = Array.isArray(parsed.allergiesMentioned)
+    ? parsed.allergiesMentioned
+      .filter((a) => a && typeof a === 'object')
+      .map((a) => ({
+        allergen: a.allergen ?? null,
+        status: a.status || 'Not Mentioned',
+        location: a.location || 'Document Text',
+        passage: a.passage || a.allergen || 'Allergy status not mentioned',
+      }))
+    : [];
+
+  const labsMentioned = Array.isArray(parsed.labsMentioned)
+    ? parsed.labsMentioned
+      .map((l) => {
+        const raw = l as Record<string, unknown>;
+        const resolvedName =
+          (typeof raw.testName === 'string' && raw.testName.trim()) ||
+          (typeof raw.test_name === 'string' && raw.test_name.trim()) ||
+          (typeof raw.name === 'string' && raw.name.trim()) ||
+          '';
+        return {
+          testName: resolvedName,
+          resultValue: typeof raw.resultValue === 'string' ? raw.resultValue : null,
+          interpretation: typeof raw.interpretation === 'string' ? raw.interpretation : null,
+          clinicalTestDate: typeof raw.clinicalTestDate === 'string' ? raw.clinicalTestDate : null,
+          orderedWithoutResult: Boolean(raw.orderedWithoutResult),
+          location: typeof raw.location === 'string' && raw.location.trim() ? raw.location : 'Document Text',
+          passage: typeof raw.passage === 'string' && raw.passage.trim() ? raw.passage : resolvedName,
+        };
+      })
+      .filter((l) => l.testName.length > 0)
+    : [];
+
+  const timelineEvents = Array.isArray(parsed.timelineEvents)
+    ? parsed.timelineEvents
+      .filter((e) => e && typeof e.title === 'string' && e.title.trim().length > 0)
+      .map((e) => ({
+        clinicalEventDate: e.clinicalEventDate ?? null,
+        eventCategory: e.eventCategory || 'Progress Note',
+        title: e.title.trim(),
+        description: e.description || e.title.trim(),
+        location: e.location || 'Document Text',
+        passage: e.passage || e.title.trim(),
+      }))
+    : [];
+
+  const extraction: GeminiDocumentExtraction = {
+    documentType: parsed.documentType ?? 'Unclassified Clinical Record',
+    documentDate: parsed.documentDate ?? null,
+    patientIdentifier: parsed.patientIdentifier ?? null,
+    age: typeof parsed.age === 'number' ? parsed.age : null,
+    sex: parsed.sex ?? null,
+    facts,
+    diagnosesMentioned,
+    medicationsMentioned,
+    allergiesMentioned,
+    labsMentioned,
+    timelineEvents,
   };
+
+  return { extraction, modelUsed, retriesUsed };
 }
 
 export async function generateClinicalSynthesisWithGemini(contextSummary: {
@@ -374,11 +404,7 @@ export async function generateClinicalSynthesisWithGemini(contextSummary: {
   modelUsed: string;
   retriesUsed: number;
 }> {
-  const ai = getAiClient();
-
-  const { text, modelUsed, retriesUsed } = await generateWithModelFallback(ai, (model) => ({
-    model,
-    contents: `Patient: ${contextSummary.patientDisplayName}, Age: ${contextSummary.age ?? 'Unknown'}
+  const userPrompt = `Patient: ${contextSummary.patientDisplayName}, Age: ${contextSummary.age ?? 'Unknown'}
 Documented Facts:
 ${contextSummary.documentedFacts.map((f) => `- ${f}`).join('\n')}
 
@@ -388,45 +414,33 @@ ${contextSummary.conflicts.length ? contextSummary.conflicts.map((c) => `- ${c}`
 Missing Clinical Information:
 ${contextSummary.missingItems.length ? contextSummary.missingItems.map((m) => `- ${m}`).join('\n') : '- None'}
 
-Provide cautious, non-prescriptive, evidence-anchored clinical intelligence commentary clearly separating verified facts from uncertainty. Never recommend specific treatment changes or resolve contradictions automatically.`,
-    config: {
-      systemInstruction:
-        'You are an evidence-verification clinical intelligence assistant. Never invent facts, never claim clinical validation, never prescribe or recommend medication changes, and explicitly highlight where conclusions must pause for human clinician review.',
-      thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-      responseMimeType: 'application/json',
-      responseSchema: {
-        type: Type.OBJECT,
-        required: [
-          'overviewInterpretation',
-          'timelineInterpretation',
-          'diagnosisInterpretation',
-          'medicationInterpretation',
-          'labInterpretation',
-          'humanReviewRecommendations',
-        ],
-        properties: {
-          overviewInterpretation: { type: Type.STRING },
-          timelineInterpretation: { type: Type.STRING },
-          diagnosisInterpretation: { type: Type.STRING },
-          medicationInterpretation: { type: Type.STRING },
-          labInterpretation: { type: Type.STRING },
-          humanReviewRecommendations: {
-            type: Type.ARRAY,
-            items: { type: Type.STRING },
-          },
-        },
-      },
-    },
-  }));
+Provide cautious, non-prescriptive, evidence-anchored clinical intelligence commentary clearly separating verified facts from uncertainty. Return valid JSON only.`;
 
-  const parsed = JSON.parse(text) as {
+  const { text, modelUsed, retriesUsed } = await callOpenAiCompatibleJson(
+    SYNTHESIS_SYSTEM_INSTRUCTION,
+    userPrompt,
+    900
+  );
+
+  const parsed = JSON.parse(text) as Partial<{
     overviewInterpretation: string;
     timelineInterpretation: string;
     diagnosisInterpretation: string;
     medicationInterpretation: string;
     labInterpretation: string;
     humanReviewRecommendations: string[];
-  };
+  }>;
 
-  return { ...parsed, modelUsed, retriesUsed };
+  return {
+    overviewInterpretation: parsed.overviewInterpretation ?? 'Insufficient structured output for overview.',
+    timelineInterpretation: parsed.timelineInterpretation ?? 'Insufficient structured output for timeline.',
+    diagnosisInterpretation: parsed.diagnosisInterpretation ?? 'Insufficient structured output for diagnoses.',
+    medicationInterpretation: parsed.medicationInterpretation ?? 'Insufficient structured output for medications.',
+    labInterpretation: parsed.labInterpretation ?? 'Insufficient structured output for labs.',
+    humanReviewRecommendations: Array.isArray(parsed.humanReviewRecommendations)
+      ? parsed.humanReviewRecommendations
+      : ['Clinician review required to verify extracted records.'],
+    modelUsed,
+    retriesUsed,
+  };
 }

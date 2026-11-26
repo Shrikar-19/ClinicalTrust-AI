@@ -1,0 +1,14 @@
+{
+    "$schema": "https://openapi.vercel.sh/vercel.json",
+    "installCommand": "npm install --legacy-peer-deps",
+    "rewrites": [
+        {
+            "source": "/api/:path*",
+            "destination": "https://clinicaltrust-ai-backend.onrender.com/api/:path*"
+        },
+        {
+            "source": "/(.*)",
+            "destination": "/index.html"
+        }
+    ]
+}

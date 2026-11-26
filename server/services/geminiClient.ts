@@ -4,8 +4,8 @@ const env = (globalThis as { process?: { env?: Record<string, string | undefined
 const LLM_BASE_URL = (env.LLM_BASE_URL || 'http://localhost:11434/v1').replace(/\/$/, '');
 const LLM_API_KEY = env.LLM_API_KEY || 'ollama';
 const PRIMARY_MODEL = env.LLM_MODEL || 'qwen2.5:3b';
-const FALLBACK_MODEL = env.LLM_FALLBACK_MODEL || PRIMARY_MODEL;
 const IS_LOCAL_OLLAMA = LLM_BASE_URL.includes('localhost') || LLM_BASE_URL.includes('127.0.0.1');
+const IS_GROQ = LLM_BASE_URL.includes('groq.com');
 
 export interface GeminiDocumentExtraction {
   documentId?: string;
@@ -185,11 +185,24 @@ function cleanJsonResponse(raw: string): string {
   return trimmed || '{}';
 }
 
+function parseRetryDelayMs(err: unknown, fallbackMs: number): number {
+  const msg = err instanceof Error ? err.message : String(err);
+  const match = msg.match(/try again in\s+(\d+(?:\.\d+)?)s/i);
+  if (match) {
+    const seconds = parseFloat(match[1]);
+    if (!Number.isNaN(seconds) && seconds > 0) {
+      return Math.min(Math.ceil(seconds * 1000) + 750, 30000);
+    }
+  }
+  return fallbackMs;
+}
+
 function isTransientError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   return (
     msg.includes('503') ||
     msg.includes('429') ||
+    msg.includes('rate_limit_exceeded') ||
     msg.includes('json_validate_failed') ||
     msg.includes('ECONNRESET') ||
     msg.includes('ETIMEDOUT') ||
@@ -202,20 +215,16 @@ async function callOpenAiCompatibleJson(
   userPrompt: string,
   localMaxTokens = 1400
 ): Promise<{ text: string; modelUsed: string; retriesUsed: number }> {
-  const attempts = [
-    { model: PRIMARY_MODEL, delayBeforeMs: 0 },
-    { model: PRIMARY_MODEL, delayBeforeMs: 500 },
-    { model: FALLBACK_MODEL, delayBeforeMs: 400 },
-  ];
+  // Each Groq free-tier model has its own independent 8,000 TPM bucket
+  const modelQueue = IS_GROQ
+    ? [PRIMARY_MODEL, 'openai/gpt-oss-120b', 'qwen/qwen3.8-27b', PRIMARY_MODEL]
+    : [PRIMARY_MODEL, PRIMARY_MODEL, PRIMARY_MODEL];
 
   let lastError: unknown;
   let retriesUsed = 0;
 
-  for (let i = 0; i < attempts.length; i++) {
-    const { model, delayBeforeMs } = attempts[i];
-    if (delayBeforeMs > 0) {
-      await new Promise((resolve) => setTimeout(resolve, delayBeforeMs));
-    }
+  for (let i = 0; i < modelQueue.length; i++) {
+    const model = modelQueue[i];
 
     try {
       const requestBody: Record<string, unknown> = {
@@ -225,7 +234,7 @@ async function callOpenAiCompatibleJson(
           { role: 'user', content: userPrompt },
         ],
         temperature: 0.1,
-        max_tokens: IS_LOCAL_OLLAMA ? localMaxTokens : 4096,
+        max_tokens: IS_LOCAL_OLLAMA ? localMaxTokens : 2400,
       };
 
       if (IS_LOCAL_OLLAMA) {
@@ -243,7 +252,9 @@ async function callOpenAiCompatibleJson(
 
       if (!response.ok) {
         const errBody = await response.text();
-        throw new Error(`LLM API error (${response.status}): ${errBody}`);
+        const retryAfter = response.headers.get('retry-after');
+        const suffix = retryAfter ? ` (try again in ${retryAfter}s)` : '';
+        throw new Error(`LLM API error (${response.status})${suffix}: ${errBody}`);
       }
 
       const data = (await response.json()) as {
@@ -262,9 +273,18 @@ async function callOpenAiCompatibleJson(
     } catch (err) {
       lastError = err;
       retriesUsed += 1;
-      if (!isTransientError(err)) {
+      if (!isTransientError(err) || i === modelQueue.length - 1) {
         break;
       }
+      const msg = err instanceof Error ? err.message : String(err);
+      // If switching to a different Groq model with its own TPM bucket, only wait 500ms;
+      // if retrying the same model, wait for Groq's exact reset window.
+      const nextModel = modelQueue[i + 1];
+      const waitMs =
+        IS_GROQ && nextModel !== model && msg.includes('429')
+          ? 500
+          : parseRetryDelayMs(err, 2500);
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
     }
   }
 

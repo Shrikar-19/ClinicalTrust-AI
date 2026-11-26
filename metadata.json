@@ -1,0 +1,6 @@
+{
+  "name": "ClinicalTrust AI",
+  "description": "Agentic Clinical Intelligence for Patient Reconstruction, Medical Reconciliation & Safe Decision Support",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

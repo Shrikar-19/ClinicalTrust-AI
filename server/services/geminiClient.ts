@@ -155,15 +155,16 @@ Extract clinical details explicitly stated in the document into a valid JSON obj
 }
 
 Rules:
-1. Return ONLY raw valid JSON with no markdown fences, commentary, or extra text. All top-level keys must be present (use [] for empty arrays, null for missing scalars).
-2. Extract ONLY facts explicitly stated in the text; do not invent or infer missing details.
-3. Keep facts[] concise: only record key demographics, symptoms, allergy status, treatment changes, or discharge info not already duplicated across multiple entries.
-4. A missing allergy mention must be recorded as "Not Mentioned" in allergiesMentioned (not "No Known Allergies") plus one Allergy fact.
-5. A lab ordered without a result must have orderedWithoutResult=true and resultValue=null.
-6. Format known dates as YYYY-MM-DD and keep verbatim quotes concise (under 20 words).`;
+1. Return ONLY raw valid RFC-8259 JSON with no markdown fences, commentary, or extra text. All top-level keys must be present (use [] for empty arrays, null for missing scalars).
+2. Never put unescaped double quotes inside JSON string values; replace inner quotes with single quotes.
+3. Extract ONLY facts explicitly stated in the text; do not invent or infer missing details.
+4. Keep facts[] concise: only record key demographics, symptoms, allergy status, treatment changes, or discharge info not already duplicated across multiple entries.
+5. A missing allergy mention must be recorded as "Not Mentioned" in allergiesMentioned (not "No Known Allergies") plus one Allergy fact.
+6. A lab ordered without a result must have orderedWithoutResult=true and resultValue=null.
+7. Format known dates as YYYY-MM-DD and keep verbatim quotes concise (under 15 words).`;
 
 const SYNTHESIS_SYSTEM_INSTRUCTION = `You are an evidence-verification clinical intelligence assistant. Do not invent facts, claim clinical validation, or recommend medication changes, and highlight where conclusions must pause for human clinician review.
-Return ONLY a raw valid JSON object (no markdown fences or commentary) matching this exact schema:
+Return ONLY a raw valid JSON object (no markdown fences or commentary, and use single quotes instead of double quotes inside string values) matching this exact schema:
 {
   "overviewInterpretation": "string",
   "timelineInterpretation": "string",
@@ -173,24 +174,135 @@ Return ONLY a raw valid JSON object (no markdown fences or commentary) matching 
   "humanReviewRecommendations": ["string"]
 }`;
 
-function cleanJsonResponse(raw: string): string {
+function repairMalformedJson(raw: string): string {
   const trimmed = raw.trim();
   const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
-  let jsonStr = fenced ? fenced[1].trim() : trimmed;
+  let text = fenced ? fenced[1].trim() : trimmed;
 
-  const firstBrace = jsonStr.indexOf('{');
-  const lastBrace = jsonStr.lastIndexOf('}');
-  if (firstBrace !== -1 && lastBrace > firstBrace) {
-    jsonStr = jsonStr.slice(firstBrace, lastBrace + 1);
+  const firstBrace = text.indexOf('{');
+  if (firstBrace === -1) return '{}';
+  text = text.slice(firstBrace);
+
+  // First pass: escape stray unescaped double quotes inside string values and strip raw control chars
+  let out = '';
+  let inString = false;
+  let escaped = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+
+    if (escaped) {
+      out += ch;
+      escaped = false;
+      continue;
+    }
+
+    if (ch === '\\') {
+      out += ch;
+      if (inString) escaped = true;
+      continue;
+    }
+
+    if (ch === '"') {
+      if (!inString) {
+        inString = true;
+        out += ch;
+      } else {
+        // Look ahead past whitespace to see if this quote validly closes a JSON key or value
+        let j = i + 1;
+        while (j < text.length && /\s/.test(text[j])) j++;
+        const nextChar = text[j];
+        if (
+          nextChar === ':' ||
+          nextChar === ',' ||
+          nextChar === '}' ||
+          nextChar === ']' ||
+          nextChar === undefined
+        ) {
+          inString = false;
+          out += ch;
+        } else {
+          // Stray quote inside string value -> escape it
+          out += '\\"';
+        }
+      }
+      continue;
+    }
+
+    if (inString && (ch === '\n' || ch === '\r' || ch === '\t')) {
+      out += ch === '\n' ? '\\n' : ch === '\r' ? '' : '\\t';
+      continue;
+    }
+
+    out += ch;
   }
 
-  // Repair common LLM JSON punctuation slips: missing commas between objects/arrays & trailing commas
-  jsonStr = jsonStr
+  if (inString) {
+    out += '"';
+  }
+
+  // Trim anything trailing after the final closing brace if complete, or repair truncation
+  const lastBrace = out.lastIndexOf('}');
+  if (lastBrace !== -1) {
+    const candidate = out.slice(0, lastBrace + 1);
+    try {
+      const quickFixed = candidate
+        .replace(/\}\s*\{/g, '},{')
+        .replace(/\]\s*\[/g, '],[')
+        .replace(/"\s+"/g, '","')
+        .replace(/,\s*([}\]])/g, '$1');
+      JSON.parse(quickFixed);
+      return quickFixed;
+    } catch {
+      // Fall through to structural bracket repair
+    }
+  }
+
+  // Structural repair: insert missing commas between adjacent values and balance brackets
+  let fixed = out
     .replace(/\}\s*\{/g, '},{')
     .replace(/\]\s*\[/g, '],[')
-    .replace(/,\s*([}\]])/g, '$1');
+    .replace(/\}\s*"/g, '},"')
+    .replace(/\]\s*"/g, '],"')
+    .replace(/"\s*\{/g, '",{')
+    .replace(/"\s*\[/g, '",[')
+    .replace(/(true|false|null|\d)\s+"/g, '$1,"')
+    .replace(/"\s+(true|false|null|\d|-)/g, '",$1')
+    .replace(/,\s*([}\]])/g, '$1')
+    .replace(/,\s*$/, '');
 
-  return jsonStr || '{}';
+  const stack: string[] = [];
+  inString = false;
+  escaped = false;
+
+  for (let i = 0; i < fixed.length; i++) {
+    const ch = fixed[i];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (ch === '\\' && inString) {
+      escaped = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (!inString) {
+      if (ch === '{') stack.push('}');
+      else if (ch === '[') stack.push(']');
+      else if ((ch === '}' || ch === ']') && stack.length > 0 && stack[stack.length - 1] === ch) {
+        stack.pop();
+      }
+    }
+  }
+
+  while (stack.length > 0) {
+    fixed += stack.pop();
+  }
+
+  return fixed || '{}';
 }
 
 function parseRetryDelayMs(err: unknown, fallbackMs: number): number {
@@ -225,7 +337,6 @@ async function callOpenAiCompatibleJson(
   userPrompt: string,
   localMaxTokens = 1400
 ): Promise<{ text: string; modelUsed: string; retriesUsed: number }> {
-  // Each Groq free-tier model has its own independent 8,000 TPM bucket
   const modelQueue = IS_GROQ
     ? [PRIMARY_MODEL, 'openai/gpt-oss-120b', 'qwen/qwen3.8-27b', PRIMARY_MODEL]
     : [PRIMARY_MODEL, PRIMARY_MODEL, PRIMARY_MODEL];
@@ -244,7 +355,7 @@ async function callOpenAiCompatibleJson(
           { role: 'user', content: userPrompt },
         ],
         temperature: 0.1,
-        max_tokens: IS_LOCAL_OLLAMA ? localMaxTokens : 2400,
+        max_tokens: IS_LOCAL_OLLAMA ? localMaxTokens : 4096,
       };
 
       if (IS_LOCAL_OLLAMA) {
@@ -272,7 +383,7 @@ async function callOpenAiCompatibleJson(
       };
 
       const rawText = data.choices?.[0]?.message?.content ?? '{}';
-      const cleaned = cleanJsonResponse(rawText);
+      const cleaned = repairMalformedJson(rawText);
       JSON.parse(cleaned);
 
       return {

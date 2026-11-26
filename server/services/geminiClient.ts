@@ -5,6 +5,7 @@ const LLM_BASE_URL = (env.LLM_BASE_URL || 'http://localhost:11434/v1').replace(/
 const LLM_API_KEY = env.LLM_API_KEY || 'ollama';
 const PRIMARY_MODEL = env.LLM_MODEL || 'qwen2.5:3b';
 const FALLBACK_MODEL = env.LLM_FALLBACK_MODEL || PRIMARY_MODEL;
+const IS_LOCAL_OLLAMA = LLM_BASE_URL.includes('localhost') || LLM_BASE_URL.includes('127.0.0.1');
 
 export interface GeminiDocumentExtraction {
   documentId?: string;
@@ -154,7 +155,7 @@ Extract clinical details explicitly stated in the document into a valid JSON obj
 }
 
 Rules:
-1. Return ONLY raw valid JSON with all top-level keys present (use [] for empty arrays, null for missing scalars).
+1. Return ONLY raw valid JSON with no markdown fences, commentary, or extra text. All top-level keys must be present (use [] for empty arrays, null for missing scalars).
 2. Extract ONLY facts explicitly stated in the text; do not invent or infer missing details.
 3. Keep facts[] concise: only record key demographics, symptoms, allergy status, treatment changes, or discharge info not already duplicated across multiple entries.
 4. A missing allergy mention must be recorded as "Not Mentioned" in allergiesMentioned (not "No Known Allergies") plus one Allergy fact.
@@ -162,7 +163,7 @@ Rules:
 6. Format known dates as YYYY-MM-DD and keep verbatim quotes concise (under 20 words).`;
 
 const SYNTHESIS_SYSTEM_INSTRUCTION = `You are an evidence-verification clinical intelligence assistant. Do not invent facts, claim clinical validation, or recommend medication changes, and highlight where conclusions must pause for human clinician review.
-Return ONLY a valid JSON object matching this exact schema:
+Return ONLY a raw valid JSON object (no markdown fences or commentary) matching this exact schema:
 {
   "overviewInterpretation": "string",
   "timelineInterpretation": "string",
@@ -174,7 +175,7 @@ Return ONLY a valid JSON object matching this exact schema:
 
 function cleanJsonResponse(raw: string): string {
   const trimmed = raw.trim();
-  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
   if (fenced) return fenced[1].trim();
   const firstBrace = trimmed.indexOf('{');
   const lastBrace = trimmed.lastIndexOf('}');
@@ -189,6 +190,7 @@ function isTransientError(err: unknown): boolean {
   return (
     msg.includes('503') ||
     msg.includes('429') ||
+    msg.includes('json_validate_failed') ||
     msg.includes('ECONNRESET') ||
     msg.includes('ETIMEDOUT') ||
     msg.includes('fetch failed')
@@ -198,7 +200,7 @@ function isTransientError(err: unknown): boolean {
 async function callOpenAiCompatibleJson(
   systemInstruction: string,
   userPrompt: string,
-  maxTokens = 1400
+  localMaxTokens = 1400
 ): Promise<{ text: string; modelUsed: string; retriesUsed: number }> {
   const attempts = [
     { model: PRIMARY_MODEL, delayBeforeMs: 0 },
@@ -216,22 +218,27 @@ async function callOpenAiCompatibleJson(
     }
 
     try {
+      const requestBody: Record<string, unknown> = {
+        model,
+        messages: [
+          { role: 'system', content: systemInstruction },
+          { role: 'user', content: userPrompt },
+        ],
+        temperature: 0.1,
+        max_tokens: IS_LOCAL_OLLAMA ? localMaxTokens : 4096,
+      };
+
+      if (IS_LOCAL_OLLAMA) {
+        requestBody.response_format = { type: 'json_object' };
+      }
+
       const response = await fetch(`${LLM_BASE_URL}/chat/completions`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${LLM_API_KEY}`,
         },
-        body: JSON.stringify({
-          model,
-          messages: [
-            { role: 'system', content: systemInstruction },
-            { role: 'user', content: userPrompt },
-          ],
-          response_format: { type: 'json_object' },
-          temperature: 0.1,
-          max_tokens: maxTokens,
-        }),
+        body: JSON.stringify(requestBody),
       });
 
       if (!response.ok) {
@@ -244,8 +251,11 @@ async function callOpenAiCompatibleJson(
       };
 
       const rawText = data.choices?.[0]?.message?.content ?? '{}';
+      const cleaned = cleanJsonResponse(rawText);
+      JSON.parse(cleaned);
+
       return {
-        text: cleanJsonResponse(rawText),
+        text: cleaned,
         modelUsed: model,
         retriesUsed,
       };
